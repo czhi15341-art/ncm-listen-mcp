@@ -1,11 +1,11 @@
-
 const express = require('express');
 
 const API = (process.env.NCM_API_BASE || '').replace(/\/+$/, '');
 const COOKIE = process.env.NCM_COOKIE || '';
 const PARTNER = process.env.NCM_PARTNER_UID || '';
 const PORT = process.env.PORT || 10000;
-const POLL_MS = 12 * 1000;
+const POLL_MS = 20 * 1000;
+const TIMEOUT_MS = 60000;
 
 const state = {
   roomId: null,
@@ -15,6 +15,7 @@ const state = {
   lastError: null,
   lastTickAt: null,
   tickCount: 0,
+  busy: false,
   history: []
 };
 
@@ -36,7 +37,7 @@ async function call(path, params = {}) {
   try {
     r = await fetch(url, {
       headers: { 'User-Agent': 'ncm-listen-mcp/1.0' },
-      signal: AbortSignal.timeout(25000)
+      signal: AbortSignal.timeout(TIMEOUT_MS)
     });
   } catch (e) {
     throw new Error(errText(e) + ' ｜ 请求 ' + path);
@@ -154,56 +155,63 @@ async function refreshSong() {
   if (state.history.length > 20) state.history.length = 20;
 }
 
-async function tick() {
-  state.lastTickAt = Date.now();
-  state.tickCount = state.tickCount + 1;
-
+async function tickOnce() {
   if (!API || !COOKIE || !PARTNER) {
     state.lastError = '环境变量不全：API=' + (API ? '有' : '空') + ' COOKIE=' + (COOKIE ? '有' : '空') + ' PARTNER=' + (PARTNER ? '有' : '空');
     return;
   }
 
+  if (!state.roomId) {
+    const inv = await findInvite();
+    if (!inv) {
+      state.lastError = null;
+      return;
+    }
+    const acc = await call('/listentogether/accept', { roomId: inv.roomId, inviterId: inv.inviterId });
+    const code = acc.data && acc.data.code;
+    if (code === 200) {
+      state.roomId = inv.roomId;
+      state.inviterId = inv.inviterId;
+      state.joinedAt = Date.now();
+      state.lastError = null;
+      await refreshSong();
+    } else {
+      state.lastError = '接受邀请失败 code=' + code + ' ' + JSON.stringify(acc.data).slice(0, 200);
+    }
+    return;
+  }
+
+  const songId = state.song ? state.song.id : '0';
+  const beat = await call('/listentogether/heatbeat', {
+    roomId: state.roomId,
+    songId: songId,
+    playStatus: 'true',
+    progress: 0
+  });
+
+  const beatCode = beat.data && beat.data.code;
+  if (beat.status === 488 || beatCode === 488) {
+    state.roomId = null;
+    state.inviterId = null;
+    state.song = null;
+    state.joinedAt = null;
+    return;
+  }
+
+  await refreshSong();
+}
+
+async function tick() {
+  if (state.busy) return;
+  state.busy = true;
+  state.lastTickAt = Date.now();
+  state.tickCount = state.tickCount + 1;
   try {
-    if (!state.roomId) {
-      const inv = await findInvite();
-      if (!inv) {
-        state.lastError = null;
-        return;
-      }
-      const acc = await call('/listentogether/accept', { roomId: inv.roomId, inviterId: inv.inviterId });
-      const code = acc.data && acc.data.code;
-      if (code === 200) {
-        state.roomId = inv.roomId;
-        state.inviterId = inv.inviterId;
-        state.joinedAt = Date.now();
-        state.lastError = null;
-        await refreshSong();
-      } else {
-        state.lastError = '接受邀请失败 code=' + code + ' ' + JSON.stringify(acc.data).slice(0, 200);
-      }
-      return;
-    }
-
-    const songId = state.song ? state.song.id : '0';
-    const beat = await call('/listentogether/heatbeat', {
-      roomId: state.roomId,
-      songId: songId,
-      playStatus: 'true',
-      progress: 0
-    });
-
-    const beatCode = beat.data && beat.data.code;
-    if (beat.status === 488 || beatCode === 488) {
-      state.roomId = null;
-      state.inviterId = null;
-      state.song = null;
-      state.joinedAt = null;
-      return;
-    }
-
-    await refreshSong();
+    await tickOnce();
   } catch (e) {
     state.lastError = errText(e);
+  } finally {
+    state.busy = false;
   }
 }
 
@@ -330,7 +338,7 @@ app.post('/mcp', async function (req, res) {
     return reply({
       protocolVersion: params.protocolVersion || '2025-06-18',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'ncm-listen-mcp', version: '1.0.1' }
+      serverInfo: { name: 'ncm-listen-mcp', version: '1.0.2' }
     });
   }
 
