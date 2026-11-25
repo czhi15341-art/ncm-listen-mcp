@@ -1,3 +1,4 @@
+
 const express = require('express');
 
 const API = (process.env.NCM_API_BASE || '').replace(/\/+$/, '');
@@ -12,8 +13,17 @@ const state = {
   song: null,
   joinedAt: null,
   lastError: null,
+  lastTickAt: null,
+  tickCount: 0,
   history: []
 };
+
+function errText(e) {
+  if (!e) return 'unknown';
+  let s = (e.name || 'Error') + ': ' + (e.message || String(e));
+  if (e.cause) s += ' | cause: ' + (e.cause.code || '') + ' ' + (e.cause.message || '');
+  return s;
+}
 
 async function call(path, params = {}) {
   const url = new URL(API + path);
@@ -21,10 +31,23 @@ async function call(path, params = {}) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   }
   if (COOKIE) url.searchParams.set('cookie', COOKIE);
-  const r = await fetch(url, { headers: { 'User-Agent': 'ncm-listen-mcp/1.0' } });
+
+  let r;
+  try {
+    r = await fetch(url, {
+      headers: { 'User-Agent': 'ncm-listen-mcp/1.0' },
+      signal: AbortSignal.timeout(25000)
+    });
+  } catch (e) {
+    throw new Error(errText(e) + ' ｜ 请求 ' + path);
+  }
+
   const text = await r.text();
   let data = null;
   try { data = JSON.parse(text); } catch (e) { data = null; }
+  if (!data) {
+    throw new Error('返回的不是 JSON，HTTP ' + r.status + ' ｜ 请求 ' + path + ' ｜ 前 120 字：' + text.slice(0, 120));
+  }
   return { status: r.status, data: data, text: text };
 }
 
@@ -79,6 +102,9 @@ function scanInvite(node) {
 async function findInvite() {
   const res = await call('/msg/private/history', { uid: PARTNER, limit: 10 });
   const data = res.data || {};
+  if (data.code && data.code !== 200) {
+    throw new Error('查私信返回 code=' + data.code + ' msg=' + (data.message || data.msg || ''));
+  }
   const list = data.msgs || data.records || (data.data && data.data.msgs) || [];
   const items = Array.isArray(list) ? list : [];
   for (const item of items) {
@@ -120,7 +146,7 @@ async function refreshSong() {
       album = (song.al && song.al.name) || (song.album && song.album.name) || '';
     }
   } catch (e) {
-    console.log('detail fail', e && e.message);
+    state.lastError = errText(e);
   }
 
   state.song = { id: songId, name: name, artist: artist, album: album, at: Date.now() };
@@ -129,14 +155,21 @@ async function refreshSong() {
 }
 
 async function tick() {
-  if (!API || !COOKIE) {
-    state.lastError = '还没配置 NCM_API_BASE 或 NCM_COOKIE';
+  state.lastTickAt = Date.now();
+  state.tickCount = state.tickCount + 1;
+
+  if (!API || !COOKIE || !PARTNER) {
+    state.lastError = '环境变量不全：API=' + (API ? '有' : '空') + ' COOKIE=' + (COOKIE ? '有' : '空') + ' PARTNER=' + (PARTNER ? '有' : '空');
     return;
   }
+
   try {
     if (!state.roomId) {
       const inv = await findInvite();
-      if (!inv) return;
+      if (!inv) {
+        state.lastError = null;
+        return;
+      }
       const acc = await call('/listentogether/accept', { roomId: inv.roomId, inviterId: inv.inviterId });
       const code = acc.data && acc.data.code;
       if (code === 200) {
@@ -146,7 +179,7 @@ async function tick() {
         state.lastError = null;
         await refreshSong();
       } else {
-        state.lastError = '接受邀请失败，返回 ' + code + ' ' + acc.status;
+        state.lastError = '接受邀请失败 code=' + code + ' ' + JSON.stringify(acc.data).slice(0, 200);
       }
       return;
     }
@@ -170,24 +203,22 @@ async function tick() {
 
     await refreshSong();
   } catch (e) {
-    state.lastError = String((e && e.message) || e);
+    state.lastError = errText(e);
   }
 }
 
 function stateText() {
+  const head = '第 ' + state.tickCount + ' 轮检查，上次 ' + (state.lastTickAt ? new Date(state.lastTickAt).toLocaleString('zh-CN') : '还没跑');
+  const err = state.lastError ? '最近一次异常：' + state.lastError : '最近没有异常';
+
   if (!state.roomId) {
-    return '现在不在房间里。' + (state.lastError ? '最近一次异常：' + state.lastError : '等你发起一起听邀请就行。');
+    return head + '\n现在不在房间里\n' + err;
   }
   if (!state.song) {
-    return '已经在房间里了，但还没读到正在放什么，等下一轮同步。';
+    return head + '\n已经在房间里，还没读到正在放什么\n' + err;
   }
   const mins = Math.max(0, Math.round((Date.now() - state.song.at) / 60000));
-  return [
-    '在房间里。',
-    '正在放：' + state.song.name + (state.song.artist ? ' - ' + state.song.artist : ''),
-    state.song.album ? '来自专辑《' + state.song.album + '》' : '',
-    '这首歌是 ' + mins + ' 分钟前换上的。'
-  ].filter(Boolean).join('\n');
+  return head + '\n在房间里\n正在放：' + state.song.name + (state.song.artist ? ' - ' + state.song.artist : '') + (state.song.album ? '（《' + state.song.album + '》）' : '') + '\n这首歌是 ' + mins + ' 分钟前换上的';
 }
 
 async function runTool(name, args) {
@@ -269,6 +300,19 @@ app.get('/', function (req, res) {
   res.type('text/plain').send('ncm-listen-mcp 活着\n' + stateText());
 });
 
+app.get('/debug', async function (req, res) {
+  const out = { api: API, partner: PARTNER, hasCookie: !!COOKIE, tickCount: state.tickCount };
+  try {
+    const r = await call('/msg/private/history', { uid: PARTNER, limit: 3 });
+    out.probeStatus = r.status;
+    out.probeCode = r.data && r.data.code;
+    out.probeHead = JSON.stringify(r.data).slice(0, 300);
+  } catch (e) {
+    out.probeError = errText(e);
+  }
+  res.type('text/plain').send(JSON.stringify(out, null, 2));
+});
+
 app.post('/mcp', async function (req, res) {
   const msg = req.body;
   if (!msg || typeof msg !== 'object') {
@@ -286,7 +330,7 @@ app.post('/mcp', async function (req, res) {
     return reply({
       protocolVersion: params.protocolVersion || '2025-06-18',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'ncm-listen-mcp', version: '1.0.0' }
+      serverInfo: { name: 'ncm-listen-mcp', version: '1.0.1' }
     });
   }
 
@@ -303,7 +347,7 @@ app.post('/mcp', async function (req, res) {
       const text = await runTool(params.name, params.arguments || {});
       return reply({ content: [{ type: 'text', text: text }] });
     } catch (e) {
-      return reply({ content: [{ type: 'text', text: '出错：' + String((e && e.message) || e) }], isError: true });
+      return reply({ content: [{ type: 'text', text: '出错：' + errText(e) }], isError: true });
     }
   }
 
@@ -315,7 +359,7 @@ app.get('/mcp', function (req, res) {
 });
 
 app.listen(PORT, function () {
-  console.log('listening on ' + PORT + ' api=' + API);
+  console.log('listening on ' + PORT + ' api=' + API + ' partner=' + PARTNER);
   tick();
   setInterval(tick, POLL_MS);
 });
