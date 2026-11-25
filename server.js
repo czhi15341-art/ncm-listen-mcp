@@ -1,6 +1,7 @@
 const express = require('express');
 
-const API = (process.env.NCM_API_BASE || '').replace(/\/+$/, '');
+const INTERNAL_PORT = 3001;
+const API = 'http://127.0.0.1:' + INTERNAL_PORT;
 const COOKIE = process.env.NCM_COOKIE || '';
 const PARTNER = process.env.NCM_PARTNER_UID || '';
 const PORT = process.env.PORT || 10000;
@@ -16,8 +17,40 @@ const state = {
   lastTickAt: null,
   tickCount: 0,
   busy: false,
+  builtin: 'starting',
   history: []
 };
+
+function startBuiltinApi() {
+  try {
+    const ncm = require('NeteaseCloudMusicApi');
+    const start = (ncm && ncm.serveNcmApi) || (ncm && ncm.default && ncm.default.serveNcmApi);
+    if (typeof start === 'function') {
+      Promise.resolve(start({ port: INTERNAL_PORT, checkVersion: false }))
+        .then(function () {
+          state.builtin = 'ok';
+          console.log('内置网易云接口已启动 ' + INTERNAL_PORT);
+        })
+        .catch(function (e) {
+          state.builtin = 'fail: ' + (e && e.message);
+          console.log('内置接口启动失败 ' + (e && e.message));
+        });
+      return;
+    }
+    if (ncm && ncm.app && typeof ncm.app.listen === 'function') {
+      ncm.app.listen(INTERNAL_PORT, function () {
+        state.builtin = 'ok';
+        console.log('内置接口(app)已启动 ' + INTERNAL_PORT);
+      });
+      return;
+    }
+    state.builtin = 'fail: 没找到启动入口';
+    console.log('NeteaseCloudMusicApi 里没找到启动入口');
+  } catch (e) {
+    state.builtin = 'fail: ' + (e && e.message);
+    console.log('加载 NeteaseCloudMusicApi 失败 ' + (e && e.message));
+  }
+}
 
 function errText(e) {
   if (!e) return 'unknown';
@@ -156,8 +189,8 @@ async function refreshSong() {
 }
 
 async function tickOnce() {
-  if (!API || !COOKIE || !PARTNER) {
-    state.lastError = '环境变量不全：API=' + (API ? '有' : '空') + ' COOKIE=' + (COOKIE ? '有' : '空') + ' PARTNER=' + (PARTNER ? '有' : '空');
+  if (!COOKIE || !PARTNER) {
+    state.lastError = '环境变量不全：COOKIE=' + (COOKIE ? '有' : '空') + ' PARTNER=' + (PARTNER ? '有' : '空');
     return;
   }
 
@@ -216,7 +249,7 @@ async function tick() {
 }
 
 function stateText() {
-  const head = '第 ' + state.tickCount + ' 轮检查，上次 ' + (state.lastTickAt ? new Date(state.lastTickAt).toLocaleString('zh-CN') : '还没跑');
+  const head = '第 ' + state.tickCount + ' 轮检查，内部接口 ' + state.builtin + '，上次 ' + (state.lastTickAt ? new Date(state.lastTickAt).toLocaleString('zh-CN') : '还没跑');
   const err = state.lastError ? '最近一次异常：' + state.lastError : '最近没有异常';
 
   if (!state.roomId) {
@@ -309,7 +342,13 @@ app.get('/', function (req, res) {
 });
 
 app.get('/debug', async function (req, res) {
-  const out = { api: API, partner: PARTNER, hasCookie: !!COOKIE, tickCount: state.tickCount };
+  const out = {
+    api: API,
+    builtin: state.builtin,
+    partner: PARTNER,
+    hasCookie: !!COOKIE,
+    tickCount: state.tickCount
+  };
   try {
     const r = await call('/msg/private/history', { uid: PARTNER, limit: 3 });
     out.probeStatus = r.status;
@@ -338,7 +377,7 @@ app.post('/mcp', async function (req, res) {
     return reply({
       protocolVersion: params.protocolVersion || '2025-06-18',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'ncm-listen-mcp', version: '1.0.2' }
+      serverInfo: { name: 'ncm-listen-mcp', version: '1.1.0' }
     });
   }
 
@@ -367,7 +406,8 @@ app.get('/mcp', function (req, res) {
 });
 
 app.listen(PORT, function () {
-  console.log('listening on ' + PORT + ' api=' + API + ' partner=' + PARTNER);
-  tick();
+  console.log('listening on ' + PORT + ' 内置接口 ' + INTERNAL_PORT + ' partner=' + PARTNER);
+  startBuiltinApi();
+  setTimeout(tick, 8000);
   setInterval(tick, POLL_MS);
 });
